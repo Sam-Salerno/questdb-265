@@ -24,6 +24,7 @@
 
 package io.questdb.cutlass.line.tcp;
 
+import io.github.pixee.security.BoundedLineReader;
 import io.questdb.cutlass.auth.PublicKeyRepo;
 import io.questdb.cutlass.auth.AuthUtils;
 import io.questdb.std.CharSequenceObjHashMap;
@@ -47,7 +48,7 @@ public class StaticPublicKeyRepo implements PublicKeyRepo {
             String line;
             do {
                 int nTokens = 0;
-                line = r.readLine();
+                line = BoundedLineReader.readLine(r, 5_000_000);
                 nLine++;
                 while (null != line) {
                     Matcher m = TOKEN_PATTERN.matcher(line);
