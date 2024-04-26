@@ -25,11 +25,17 @@
 package io.questdb;
 
 import io.questdb.cairo.security.SecurityContextFactory;
+import io.questdb.cairo.wal.WalInitializerFactory;
 import io.questdb.cutlass.auth.AuthenticatorFactory;
 import io.questdb.cutlass.pgwire.PgWireAuthenticationFactory;
 import io.questdb.griffin.SqlCompilerFactory;
+import io.questdb.std.QuietCloseable;
 
-public interface FactoryProvider {
+public interface FactoryProvider extends QuietCloseable {
+    @Override
+    default void close() {
+    }
+
     AuthenticatorFactory getAuthenticatorFactory();
 
     PgWireAuthenticationFactory getPgWireAuthenticationFactory();
@@ -37,4 +43,6 @@ public interface FactoryProvider {
     SecurityContextFactory getSecurityContextFactory();
 
     SqlCompilerFactory getSqlCompilerFactory();
+
+    WalInitializerFactory getWalInitializerFactory();
 }

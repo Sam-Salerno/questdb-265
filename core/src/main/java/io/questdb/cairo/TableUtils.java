@@ -59,6 +59,7 @@ public final class TableUtils {
     public static final String COLUMN_VERSION_FILE_NAME = "_cv";
     public static final String DEFAULT_PARTITION_NAME = "default";
     public static final String DETACHED_DIR_MARKER = ".detached";
+    public static final long ESTIMATED_VAR_COL_SIZE = 28;
     public static final String FILE_SUFFIX_D = ".d";
     public static final String FILE_SUFFIX_I = ".i";
     public static final int INITIAL_TXN = 0;
@@ -69,8 +70,11 @@ public final class TableUtils {
     public static final long META_OFFSET_COLUMN_TYPES = 128;
     public static final long META_OFFSET_COUNT = 0;
     public static final long META_OFFSET_MAX_UNCOMMITTED_ROWS = 20; // LONG
+    public static final long META_OFFSET_METADATA_VERSION = 32; // LONG
     public static final long META_OFFSET_O3_MAX_LAG = 24; // LONG
-    public static final long META_OFFSET_STRUCTURE_VERSION = 32; // LONG
+    // INT - symbol map count, this is a variable part of transaction file
+    // below this offset we will have INT values for symbol map size
+    public static final long META_OFFSET_PARTITION_BY = 4;
     public static final long META_OFFSET_TABLE_ID = 16;
     public static final long META_OFFSET_TIMESTAMP_INDEX = 8;
     public static final long META_OFFSET_VERSION = 12;
@@ -161,9 +165,6 @@ public final class TableUtils {
     static final int META_FLAG_BIT_INDEXED = 1;
     static final int META_FLAG_BIT_NOT_INDEXED = 0;
     static final int META_FLAG_BIT_SEQUENTIAL = 1 << 1;
-    // INT - symbol map count, this is a variable part of transaction file
-    // below this offset we will have INT values for symbol map size
-    public static final long META_OFFSET_PARTITION_BY = 4;
     static final byte TODO_RESTORE_META = 2;
     static final byte TODO_TRUNCATE = 1;
     private static final int EMPTY_TABLE_LAG_CHECKSUM = calculateTxnLagChecksum(0, 0, 0, Long.MAX_VALUE, Long.MIN_VALUE, 0);
@@ -383,6 +384,7 @@ public final class TableUtils {
     public static void createTableNameFile(MemoryMARW mem, CharSequence charSequence) {
         mem.putStr(charSequence);
         mem.putByte((byte) 0);
+        mem.sync(false);
         mem.close(true, Vm.TRUNCATE_TO_POINTER);
     }
 
@@ -498,6 +500,20 @@ public final class TableUtils {
 
     public static LPSZ dFile(Path path, CharSequence columnName) {
         return dFile(path, columnName, COLUMN_NAME_TXN_NONE);
+    }
+
+    public static long estimateAvgRecordSize(RecordMetadata metadata) {
+        long recSize = 0;
+        for (int i = 0, n = metadata.getColumnCount(); i < n; i++) {
+            int columnType = metadata.getColumnType(i);
+            if (ColumnType.isVariableLength(columnType)) {
+                // Estimate size of variable length column as 28 bytes
+                recSize += ESTIMATED_VAR_COL_SIZE;
+            } else if (columnType > 0) {
+                recSize += ColumnType.sizeOf(columnType);
+            }
+        }
+        return recSize;
     }
 
     public static int exists(FilesFacade ff, Path path, CharSequence root, CharSequence name) {
@@ -750,7 +766,7 @@ public final class TableUtils {
         }
 
         if (verbose) {
-            LOG.info().$("locked '").utf8(path).$("' [fd=").$(fd).I$();
+            LOG.debug().$("locked '").utf8(path).$("' [fd=").$(fd).I$();
         }
         return fd;
     }
@@ -1026,10 +1042,42 @@ public final class TableUtils {
         }
     }
 
+    public static void removeColumnFromMetadata(
+            CharSequence columnName,
+            LowerCaseCharSequenceIntHashMap columnNameIndexMap,
+            ObjList<TableColumnMetadata> columnMetadata
+    ) {
+        final int columnIndex = columnNameIndexMap.get(columnName);
+        if (columnIndex < 0) {
+            throw CairoException.critical(0).put("Column not found: ").put(columnName);
+        }
+
+        columnNameIndexMap.remove(columnName);
+        final TableColumnMetadata deletedMeta = columnMetadata.getQuick(columnIndex);
+        deletedMeta.markDeleted();
+    }
+
     public static void removeOrException(FilesFacade ff, int fd, LPSZ path) {
         if (ff.exists(path) && !ff.closeRemove(fd, path)) {
             throw CairoException.critical(ff.errno()).put("Cannot remove ").put(path);
         }
+    }
+
+    public static void renameColumnInMetadata(
+            CharSequence columnName,
+            CharSequence newName,
+            LowerCaseCharSequenceIntHashMap columnNameIndexMap,
+            ObjList<TableColumnMetadata> columnMetadata
+    ) {
+        final int columnIndex = columnNameIndexMap.get(columnName);
+        if (columnIndex < 0) {
+            throw CairoException.critical(0).put("Column not found: ").put(columnName);
+        }
+        final String newNameStr = newName.toString();
+        columnMetadata.getQuick(columnIndex).setName(newNameStr);
+
+        columnNameIndexMap.removeEntry(columnName);
+        columnNameIndexMap.put(newNameStr, columnIndex);
     }
 
     public static void renameOrFail(FilesFacade ff, Path src, Path dst) {
@@ -1049,6 +1097,7 @@ public final class TableUtils {
         mem.putLong(0, 0); // txn
         mem.putLong(32, 0); // count
         mem.jumpTo(40);
+        mem.sync(false);
     }
 
     public static void resetTxn(
@@ -1409,6 +1458,7 @@ public final class TableUtils {
             for (int i = 0; i < count; i++) {
                 mem.putStr(structure.getColumnName(i));
             }
+            mem.sync(false);
 
             // create symbol maps
             int symbolMapCount = 0;
@@ -1428,9 +1478,10 @@ public final class TableUtils {
             }
             mem.smallFile(ff, path.trimTo(rootLen).concat(TXN_FILE_NAME).$(), MemoryTag.MMAP_DEFAULT);
             createTxn(mem, symbolMapCount, 0L, 0L, INITIAL_TXN, 0L, 0L, 0L, 0L);
-
+            mem.sync(false);
             mem.smallFile(ff, path.trimTo(rootLen).concat(COLUMN_VERSION_FILE_NAME).$(), MemoryTag.MMAP_DEFAULT);
             createColumnVersionFile(mem);
+            mem.sync(false);
             mem.close();
 
             resetTodoLog(ff, path, rootLen, mem);
@@ -1441,13 +1492,7 @@ public final class TableUtils {
             createTableNameFile(mem, getTableNameFromDirName(tableDir));
         } finally {
             if (dirFd > 0) {
-                if (ff.fsync(dirFd) != 0) {
-                    LOG.error()
-                            .$("could not fsync [fd=").$(dirFd)
-                            .$(", errno=").$(ff.errno())
-                            .I$();
-                }
-                ff.close(dirFd);
+                ff.fsyncAndClose(dirFd);
             }
         }
     }
@@ -1573,6 +1618,7 @@ public final class TableUtils {
     }
 
     static {
+        //noinspection ConstantValue
         assert TX_OFFSET_LAG_MAX_TIMESTAMP_64 + 8 <= TX_OFFSET_MAP_WRITER_COUNT_32;
     }
 }

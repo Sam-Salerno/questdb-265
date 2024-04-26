@@ -226,7 +226,7 @@ public class PropServerConfigurationTest {
         Assert.assertEquals(2048, configuration.getLineUdpReceiverConfiguration().getMsgBufferSize());
         Assert.assertEquals(10000, configuration.getLineUdpReceiverConfiguration().getMsgCount());
         Assert.assertEquals(8388608, configuration.getLineUdpReceiverConfiguration().getReceiveBufferSize());
-        Assert.assertTrue(configuration.getLineUdpReceiverConfiguration().isEnabled());
+        Assert.assertFalse(configuration.getLineUdpReceiverConfiguration().isEnabled());
         Assert.assertEquals(-1, configuration.getLineUdpReceiverConfiguration().ownThreadAffinity());
         Assert.assertFalse(configuration.getLineUdpReceiverConfiguration().ownThread());
 
@@ -613,6 +613,31 @@ public class PropServerConfigurationTest {
     }
 
     @Test
+    public void testILPMsgBufferSizeAdjustment() throws Exception {
+        Properties properties = new Properties();
+
+        properties.setProperty(PropertyKey.LINE_TCP_MAX_MEASUREMENT_SIZE.getPropertyPath(), "1024");
+        properties.setProperty(PropertyKey.LINE_TCP_MSG_BUFFER_SIZE.getPropertyPath(), "8192");
+        PropServerConfiguration configuration = new PropServerConfiguration(root, properties, null, LOG, new BuildInformationHolder());
+        Assert.assertEquals(1024, configuration.getLineTcpReceiverConfiguration().getMaxMeasurementSize());
+        Assert.assertEquals(8192, configuration.getLineTcpReceiverConfiguration().getNetMsgBufferSize());
+
+        properties.setProperty(PropertyKey.LINE_TCP_MAX_MEASUREMENT_SIZE.getPropertyPath(), "1024");
+        properties.setProperty(PropertyKey.LINE_TCP_MSG_BUFFER_SIZE.getPropertyPath(), "1024");
+        configuration = new PropServerConfiguration(root, properties, null, LOG, new BuildInformationHolder());
+        Assert.assertEquals(1024, configuration.getLineTcpReceiverConfiguration().getMaxMeasurementSize());
+        Assert.assertEquals(1024, configuration.getLineTcpReceiverConfiguration().getNetMsgBufferSize());
+
+        // if the msg buffer size is smaller than the max measurement size,
+        // then msg buffer size is adjusted to have enough space at least for a single measurement
+        properties.setProperty(PropertyKey.LINE_TCP_MAX_MEASUREMENT_SIZE.getPropertyPath(), "1024");
+        properties.setProperty(PropertyKey.LINE_TCP_MSG_BUFFER_SIZE.getPropertyPath(), "256");
+        configuration = new PropServerConfiguration(root, properties, null, LOG, new BuildInformationHolder());
+        Assert.assertEquals(1024, configuration.getLineTcpReceiverConfiguration().getMaxMeasurementSize());
+        Assert.assertEquals(1024, configuration.getLineTcpReceiverConfiguration().getNetMsgBufferSize());
+    }
+
+    @Test
     public void testImportWorkRootCantBeTheSameAsOtherInstanceDirectories() throws Exception {
         Properties properties = new Properties();
 
@@ -621,13 +646,13 @@ public class PropServerConfigurationTest {
 
         //direct cases
         assertInputWorkRootCantBeSetTo(properties, root);
-        assertInputWorkRootCantBeSetTo(properties, configuration.getCairoConfiguration().getRoot().toString());
+        assertInputWorkRootCantBeSetTo(properties, configuration.getCairoConfiguration().getRoot());
         assertInputWorkRootCantBeSetTo(properties, configuration.getCairoConfiguration().getSnapshotRoot().toString());
         assertInputWorkRootCantBeSetTo(properties, configuration.getCairoConfiguration().getConfRoot().toString());
 
         //relative cases
         assertInputWorkRootCantBeSetTo(properties, getRelativePath(root));
-        assertInputWorkRootCantBeSetTo(properties, getRelativePath(configuration.getCairoConfiguration().getRoot().toString()));
+        assertInputWorkRootCantBeSetTo(properties, getRelativePath(configuration.getCairoConfiguration().getRoot()));
         assertInputWorkRootCantBeSetTo(properties, getRelativePath(configuration.getCairoConfiguration().getSnapshotRoot().toString()));
         assertInputWorkRootCantBeSetTo(properties, getRelativePath(configuration.getCairoConfiguration().getConfRoot().toString()));
     }
@@ -640,8 +665,8 @@ public class PropServerConfigurationTest {
 
         PropServerConfiguration configuration = new PropServerConfiguration(root, properties, null, LOG, new BuildInformationHolder());
         Assert.assertNull(configuration.getCairoConfiguration().getSqlCopyInputWorkRoot());
-        assertInputWorkRootCantBeSetTo(properties, configuration.getCairoConfiguration().getRoot().toString().toUpperCase());
-        assertInputWorkRootCantBeSetTo(properties, configuration.getCairoConfiguration().getRoot().toString().toLowerCase());
+        assertInputWorkRootCantBeSetTo(properties, configuration.getCairoConfiguration().getRoot().toUpperCase());
+        assertInputWorkRootCantBeSetTo(properties, configuration.getCairoConfiguration().getRoot().toLowerCase());
     }
 
     @Test(expected = ServerConfigurationException.class)

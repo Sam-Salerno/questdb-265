@@ -43,7 +43,6 @@ import static io.questdb.cairo.TableUtils.iFile;
 
 public class UpdateOperatorImpl implements QuietCloseable, UpdateOperator {
     private static final Log LOG = LogFactory.getLog(UpdateOperatorImpl.class);
-    private final CairoConfiguration configuration;
     private final long dataAppendPageSize;
     private final ObjList<MemoryCMARW> dstColumns = new ObjList<>();
     private final FilesFacade ff;
@@ -66,11 +65,10 @@ public class UpdateOperatorImpl implements QuietCloseable, UpdateOperator {
         this.tableWriter = tableWriter;
         this.rootLen = rootLen;
         this.purgingOperator = purgingOperator;
-        this.indexBuilder = new IndexBuilder();
+        this.indexBuilder = new IndexBuilder(configuration);
         this.dataAppendPageSize = configuration.getDataAppendPageSize();
         this.fileOpenOpts = configuration.getWriterFileOpenOpts();
         this.ff = configuration.getFilesFacade();
-        this.configuration = configuration;
         this.path = path;
     }
 
@@ -99,9 +97,9 @@ public class UpdateOperatorImpl implements QuietCloseable, UpdateOperator {
             final TableRecordMetadata tableMetadata = tableWriter.getMetadata();
 
             // Check that table structure hasn't changed between planning and executing the UPDATE
-            if (tableMetadata.getTableId() != tableId || tableWriter.getStructureVersion() != tableVersion) {
+            if (tableMetadata.getTableId() != tableId || tableWriter.getMetadataVersion() != tableVersion) {
                 throw TableReferenceOutOfDateException.of(tableToken, tableId, tableMetadata.getTableId(),
-                        tableVersion, tableWriter.getStructureVersion());
+                        tableVersion, tableWriter.getMetadataVersion());
             }
 
             // Select the rows to be updated
@@ -694,12 +692,12 @@ public class UpdateOperatorImpl implements QuietCloseable, UpdateOperator {
             TableWriter tableWriter
     ) {
         int pathTrimToLen = path.length();
-        indexBuilder.of(path.trimTo(rootLen), configuration);
+        indexBuilder.of(path.trimTo(rootLen));
         for (int i = 0, n = updateColumnIndexes.size(); i < n; i++) {
             int columnIndex = updateColumnIndexes.get(i);
             if (tableMetadata.isColumnIndexed(columnIndex)) {
                 CharSequence colName = tableMetadata.getColumnName(columnIndex);
-                indexBuilder.reindexAfterUpdate(partitionTimestamp, colName, tableWriter);
+                indexBuilder.reindexAfterUpdate(ff, partitionTimestamp, colName, tableWriter);
             }
         }
         indexBuilder.clear();

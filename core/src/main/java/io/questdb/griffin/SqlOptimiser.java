@@ -476,7 +476,10 @@ public class SqlOptimiser {
     private void addTopDownColumn0(@Transient ExpressionNode node, QueryModel model, CharSequence name) {
         if (model.isTopDownNameMissing(name)) {
             model.addTopDownColumn(
-                    queryColumnPool.next().of(name, expressionNodePool.next().of(node.type, name, node.precedence, node.position))
+                    queryColumnPool.next().of(
+                            name,
+                            expressionNodePool.next().of(node.type, name, node.precedence, node.position)
+                    )
                     , name
             );
         }
@@ -1513,10 +1516,7 @@ public class SqlOptimiser {
             // the translating model, but not to the inner one.
             alias = map.valueAtQuick(index);
             if (innerModel != null && innerModel.getColumnNameToAliasMap().excludes(alias)) {
-                QueryColumn column = translatingModel.getAliasToColumnMap().get(alias);
-                assert column != null;
-                // but equally, column may already be referenced by translating model
-                innerModel.addBottomUpColumn(column, true);
+                innerModel.addBottomUpColumn(nextColumn(alias), true);
             }
         }
         return nextLiteral(alias, node.position);
@@ -1749,7 +1749,7 @@ public class SqlOptimiser {
     }
 
     private void enumerateColumns(QueryModel model, TableRecordMetadata metadata) throws SqlException {
-        model.setTableVersion(metadata.getStructureVersion());
+        model.setTableVersion(metadata.getMetadataVersion());
         model.setTableId(metadata.getTableId());
         copyColumnsFromMetadata(model, metadata, false);
         if (model.isUpdate()) {
@@ -2001,20 +2001,25 @@ public class SqlOptimiser {
 
     private boolean isEffectivelyConstantExpression(ExpressionNode node) {
         sqlNodeStack.clear();
-        while (null != node) {
-            if (node.type == ExpressionNode.OPERATION) {
-                sqlNodeStack.push(node.rhs);
-                node = node.lhs;
-            }
-
-            if (!(node.type == ExpressionNode.CONSTANT || (node.type == ExpressionNode.FUNCTION && functionParser.getFunctionFactoryCache().isRuntimeConstant(node.token)))) {
+        while (node != null) {
+            if (node.type != ExpressionNode.OPERATION
+                    && node.type != ExpressionNode.CONSTANT
+                    && !(node.type == ExpressionNode.FUNCTION && functionParser.getFunctionFactoryCache().isRuntimeConstant(node.token))) {
                 return false;
             }
 
-            if (sqlNodeStack.isEmpty()) {
-                node = null;
+            if (node.lhs != null) {
+                sqlNodeStack.push(node.lhs);
+            }
+
+            if (node.rhs != null) {
+                node = node.rhs;
             } else {
-                node = sqlNodeStack.poll();
+                if (!sqlNodeStack.isEmpty()) {
+                    node = this.sqlNodeStack.poll();
+                } else {
+                    node = null;
+                }
             }
         }
 
@@ -2872,6 +2877,9 @@ public class SqlOptimiser {
                 for (int k = 0, z = jc.aIndexes.size(); k < z; k++) {
                     emitLiteralsTopDown(jc.aNodes.getQuick(k), model);
                     emitLiteralsTopDown(jc.bNodes.getQuick(k), model);
+
+                    emitLiteralsTopDown(jc.aNodes.getQuick(k), jm);
+                    emitLiteralsTopDown(jc.bNodes.getQuick(k), jm);
 
                     if (papaModel != null) {
                         emitLiteralsTopDown(jc.aNodes.getQuick(k), papaModel);

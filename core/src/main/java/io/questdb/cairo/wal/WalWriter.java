@@ -30,7 +30,6 @@ import io.questdb.cairo.sql.SymbolTable;
 import io.questdb.cairo.sql.TableRecordMetadata;
 import io.questdb.cairo.sql.TableReferenceOutOfDateException;
 import io.questdb.cairo.vm.Vm;
-import io.questdb.cairo.vm.api.MemoryA;
 import io.questdb.cairo.vm.api.MemoryMA;
 import io.questdb.cairo.vm.api.MemoryMAR;
 import io.questdb.cairo.vm.api.NullMemory;
@@ -80,13 +79,14 @@ public class WalWriter implements TableWriterAPI {
     private final RowImpl row = new RowImpl();
     private final LongList rowValueIsNotNull = new LongList();
     private final TableSequencerAPI sequencer;
-    private final MemoryMAR symbolMapMem = Vm.getMARInstance();
+    private final MemoryMAR symbolMapMem;
     private final BoolList symbolMapNullFlags = new BoolList();
     private final ObjList<SymbolMapReader> symbolMapReaders = new ObjList<>();
     private final ObjList<CharSequenceIntHashMap> symbolMaps = new ObjList<>();
     private final ObjList<ByteCharSequenceIntHashMap> utf8SymbolMaps = new ObjList<>();
     private final Uuid uuid = new Uuid();
     private final int walId;
+    private final WalInitializer walInitializer;
     private final String walName;
     private int columnCount;
     private ColumnVersionReader columnVersionReader;
@@ -116,6 +116,7 @@ public class WalWriter implements TableWriterAPI {
         this.configuration = configuration;
         this.mkDirMode = configuration.getMkDirMode();
         this.ff = configuration.getFilesFacade();
+        this.walInitializer = configuration.getFactoryProvider().getWalInitializerFactory().getInstance();
         this.tableToken = tableToken;
         final int walId = tableSequencerAPI.getNextWalId(tableToken);
         this.walName = WAL_NAME_BASE + walId;
@@ -124,6 +125,7 @@ public class WalWriter implements TableWriterAPI {
         this.rootLen = path.length();
         this.metrics = metrics;
         this.open = true;
+        this.symbolMapMem = Vm.getMARInstance(configuration.getCommitMode());
 
         try {
             lockWal();
@@ -250,6 +252,11 @@ public class WalWriter implements TableWriterAPI {
             if (inTransaction()) {
                 final long rowsToCommit = getUncommittedRowCount();
                 lastSegmentTxn = events.appendData(currentTxnStartRowNum, segmentRowCount, txnMinTimestamp, txnMaxTimestamp, txnOutOfOrder);
+                // flush disk before getting next txn
+                final int commitMode = configuration.getCommitMode();
+                if (commitMode != CommitMode.NOSYNC) {
+                    sync(commitMode);
+                }
                 final long seqTxn = getSequencerTxn();
                 LOG.debug().$("committed data block [wal=").$(path).$(Files.SEPARATOR).$(segmentId).$(", seqTxn=").$(seqTxn)
                         .$(", rowLo=").$(currentTxnStartRowNum).$(", roHi=").$(segmentRowCount)
@@ -275,7 +282,9 @@ public class WalWriter implements TableWriterAPI {
     public void doClose(boolean truncate) {
         if (open) {
             open = false;
-            metadata.close(Vm.TRUNCATE_TO_POINTER);
+            if (metadata != null) {
+                metadata.close(Vm.TRUNCATE_TO_POINTER);
+            }
             Misc.free(events);
             freeSymbolMapReaders();
             Misc.free(symbolMapMem);
@@ -297,17 +306,13 @@ public class WalWriter implements TableWriterAPI {
         return metadata;
     }
 
-    public int getSegmentId() {
-        return segmentId;
+    @Override
+    public long getMetadataVersion() {
+        return metadata.getMetadataVersion();
     }
 
     public long getSegmentRowCount() {
         return segmentRowCount;
-    }
-
-    @Override
-    public long getStructureVersion() {
-        return metadata.getStructureVersion();
     }
 
     @Override
@@ -428,6 +433,13 @@ public class WalWriter implements TableWriterAPI {
         if (uncommittedRows > 0) {
             final int oldSegmentId = segmentId;
             final int newSegmentId = segmentId + 1;
+            if (newSegmentId > WalUtils.SEG_MAX_ID) {
+                throw CairoException.critical(0)
+                        .put("cannot roll over to new segment due to SEG_MAX_ID overflow ")
+                        .put("[table=").put(tableToken.getTableName())
+                        .put(", walId=").put(walId)
+                        .put(", segmentId=").put(newSegmentId).put(']');
+            }
             final int oldSegmentLockFd = segmentLockFd;
             segmentLockFd = -1;
             try {
@@ -441,10 +453,11 @@ public class WalWriter implements TableWriterAPI {
                 try {
                     final int timestampIndex = metadata.getTimestampIndex();
                     LOG.info().$("rolling uncommitted rows to new segment [wal=")
-                            .$(path).$(Files.SEPARATOR).$(segmentId)
+                            .$(path).$(Files.SEPARATOR).$(oldSegmentId)
                             .$(", newSegment=").$(newSegmentId)
                             .$(", rowCount=").$(uncommittedRows).I$();
 
+                    final int commitMode = configuration.getCommitMode();
                     for (int columnIndex = 0; columnIndex < columnCount; columnIndex++) {
                         final int columnType = metadata.getColumnType(columnIndex);
                         if (columnType > 0) {
@@ -452,7 +465,8 @@ public class WalWriter implements TableWriterAPI {
                             final MemoryMA secondaryColumn = getSecondaryColumn(columnIndex);
                             final String columnName = metadata.getColumnName(columnIndex);
 
-                            CopyWalSegmentUtils.rollColumnToSegment(ff,
+                            CopyWalSegmentUtils.rollColumnToSegment(
+                                    ff,
                                     configuration.getWriterFileOpenOpts(),
                                     primaryColumn,
                                     secondaryColumn,
@@ -463,7 +477,8 @@ public class WalWriter implements TableWriterAPI {
                                     currentTxnStartRowNum,
                                     uncommittedRows,
                                     newColumnFiles,
-                                    columnIndex
+                                    columnIndex,
+                                    commitMode
                             );
                         } else {
                             rowValueIsNotNull.setQuick(columnIndex, COLUMN_DELETED_NULL_FLAG);
@@ -536,7 +551,7 @@ public class WalWriter implements TableWriterAPI {
         this.tableToken = tableToken;
     }
 
-    private static void configureNullSetters(ObjList<Runnable> nullers, int type, MemoryA mem1, MemoryA mem2) {
+    private static void configureNullSetters(ObjList<Runnable> nullers, int type, MemoryMA mem1, MemoryMA mem2) {
         switch (ColumnType.tagOf(type)) {
             case ColumnType.BOOLEAN:
             case ColumnType.BYTE:
@@ -624,8 +639,8 @@ public class WalWriter implements TableWriterAPI {
     }
 
     private void applyMetadataChangeLog(long structureVersionHi) {
-        try (TableMetadataChangeLog log = sequencer.getMetadataChangeLog(tableToken, metadata.getStructureVersion())) {
-            long structVer = getStructureVersion();
+        try (TableMetadataChangeLog log = sequencer.getMetadataChangeLog(tableToken, getColumnStructureVersion())) {
+            long structVer = getColumnStructureVersion();
             while (log.hasNext() && structVer < structureVersionHi) {
                 TableMetadataChange chg = log.next();
                 try {
@@ -635,7 +650,7 @@ public class WalWriter implements TableWriterAPI {
                     throw e;
                 }
 
-                if (++structVer != getStructureVersion()) {
+                if (++structVer != getColumnStructureVersion()) {
                     distressed = true;
                     throw CairoException.critical(0)
                             .put("could not apply table definition changes to the current transaction, version unchanged");
@@ -649,9 +664,9 @@ public class WalWriter implements TableWriterAPI {
             throw CairoException.critical(0).put("failed to commit ALTER SQL to WAL, sql context is empty [table=").put(tableToken.getTableName()).put(']');
         }
         if (
-                (verifyStructureVersion && op.getTableVersion() != getStructureVersion())
+                (verifyStructureVersion && op.getTableVersion() != getColumnStructureVersion())
                         || op.getTableId() != metadata.getTableId()) {
-            throw TableReferenceOutOfDateException.of(tableToken, metadata.getTableId(), op.getTableId(), getStructureVersion(), op.getTableVersion());
+            throw TableReferenceOutOfDateException.of(tableToken, metadata.getTableId(), op.getTableId(), getColumnStructureVersion(), op.getTableVersion());
         }
 
         try {
@@ -671,12 +686,12 @@ public class WalWriter implements TableWriterAPI {
             try {
                 metaValidatorSvc.startAlterValidation();
                 alterOp.apply(metaValidatorSvc, true);
-                if (metaValidatorSvc.structureVersion != metadata.getStructureVersion() + 1) {
+                if (metaValidatorSvc.structureVersion != getColumnStructureVersion() + 1) {
                     retry = false;
                     throw CairoException.nonCritical()
                             .put("statements containing multiple transactions, such as 'alter table add column col1, col2'" +
                                     " are currently not supported for WAL tables [table=").put(tableToken.getTableName())
-                            .put(", oldStructureVersion=").put(metadata.getStructureVersion())
+                            .put(", oldStructureVersion=").put(getColumnStructureVersion())
                             .put(", newStructureVersion=").put(metaValidatorSvc.structureVersion).put(']');
                 }
             } catch (CairoException e) {
@@ -691,7 +706,7 @@ public class WalWriter implements TableWriterAPI {
             }
 
             try {
-                txn = sequencer.nextStructureTxn(tableToken, metadata.getStructureVersion(), alterOp);
+                txn = sequencer.nextStructureTxn(tableToken, getColumnStructureVersion(), alterOp);
                 if (txn == NO_TXN) {
                     applyMetadataChangeLog(Long.MAX_VALUE);
                 }
@@ -740,18 +755,24 @@ public class WalWriter implements TableWriterAPI {
     }
 
     private void closeSegmentSwitchFiles(LongList newColumnFiles) {
+        int commitMode = configuration.getCommitMode();
+
         // Each record is about primary and secondary file. File descriptor is set every half a record.
         int halfRecord = NEW_COL_RECORD_SIZE / 2;
         for (int fdIndex = 0; fdIndex < newColumnFiles.size(); fdIndex += halfRecord) {
             final int fd = (int) newColumnFiles.get(fdIndex);
-            ff.close(fd);
+            if (commitMode != CommitMode.NOSYNC) {
+                ff.fsyncAndClose(fd);
+            } else {
+                ff.close(fd);
+            }
         }
     }
 
     private void configureColumn(int index, int columnType) {
         final int baseIndex = getPrimaryColumnIndex(index);
         if (columnType > 0) {
-            final MemoryMA primary = Vm.getMAInstance();
+            final MemoryMA primary = Vm.getMAInstance(configuration.getCommitMode());
             final MemoryMA secondary = createSecondaryMem(columnType);
             columns.extendAndSet(baseIndex, primary);
             columns.extendAndSet(baseIndex + 1, secondary);
@@ -907,11 +928,11 @@ public class WalWriter implements TableWriterAPI {
                         columnVersionReader.ofRO(ff, path);
 
                         initialized = true;
-                        long structureVersion = getStructureVersion();
+                        long structureVersion = getMetadataVersion();
 
                         do {
                             TableUtils.safeReadTxn(txReader, milliClock, spinLockTimeout);
-                            if (txReader.getStructureVersion() != structureVersion) {
+                            if (txReader.getColumnStructureVersion() != structureVersion) {
                                 initialized = false;
                                 break;
                             }
@@ -947,7 +968,7 @@ public class WalWriter implements TableWriterAPI {
         switch (ColumnType.tagOf(columnType)) {
             case ColumnType.BINARY:
             case ColumnType.STRING:
-                return Vm.getMAInstance();
+                return Vm.getMAInstance(configuration.getCommitMode());
             default:
                 return null;
         }
@@ -961,6 +982,7 @@ public class WalWriter implements TableWriterAPI {
         if (ff.mkdirs(path.slash$(), mkDirMode) != 0) {
             throw CairoException.critical(ff.errno()).put("Cannot create WAL segment directory: ").put(path);
         }
+        walInitializer.initSegmentDirectory(path, tableToken, walId, segmentId);
         path.trimTo(segmentPathLen);
         return segmentPathLen;
     }
@@ -990,6 +1012,11 @@ public class WalWriter implements TableWriterAPI {
         Misc.freeObjListIfCloseable(symbolMapReaders);
     }
 
+    private long getColumnStructureVersion() {
+        // Sequencer metadata version is the same as column structure version of the table.
+        return metadata.getMetadataVersion();
+    }
+
     private MemoryMA getPrimaryColumn(int column) {
         assert column < columnCount : "Column index is out of bounds: " + column + " >= " + columnCount;
         return columns.getQuick(getPrimaryColumnIndex(column));
@@ -1003,7 +1030,7 @@ public class WalWriter implements TableWriterAPI {
     private long getSequencerTxn() {
         long seqTxn;
         do {
-            seqTxn = sequencer.nextTxn(tableToken, walId, metadata.getStructureVersion(), segmentId, lastSegmentTxn);
+            seqTxn = sequencer.nextTxn(tableToken, walId, getColumnStructureVersion(), segmentId, lastSegmentTxn);
             if (seqTxn == NO_TXN) {
                 applyMetadataChangeLog(Long.MAX_VALUE);
             }
@@ -1097,6 +1124,13 @@ public class WalWriter implements TableWriterAPI {
             rowValueIsNotNull.fill(0, columnCount, -1);
             final int segmentPathLen = createSegmentDir(newSegmentId);
             segmentId = newSegmentId;
+            final int dirFd;
+            final int commitMode = configuration.getCommitMode();
+            if (Os.isWindows() || commitMode == CommitMode.NOSYNC) {
+                dirFd = -1;
+            } else {
+                dirFd = TableUtils.openRO(ff, path, LOG);
+            }
 
             for (int i = 0; i < columnCount; i++) {
                 int type = metadata.getColumnType(i);
@@ -1120,16 +1154,30 @@ public class WalWriter implements TableWriterAPI {
             segmentRowCount = 0;
             metadata.switchTo(path, segmentPathLen);
             events.openEventFile(path, segmentPathLen);
+            if (commitMode != CommitMode.NOSYNC) {
+                events.sync();
+            }
+
+            if (dirFd != -1) {
+                ff.fsyncAndClose(dirFd);
+            }
             lastSegmentTxn = 0;
             LOG.info().$("opened WAL segment [path='").$(path).$('\'').I$();
         } finally {
-            releaseSegmentLock(oldSegmentId, oldSegmentLockFd);
+            if (oldSegmentLockFd > -1) {
+                releaseSegmentLock(oldSegmentId, oldSegmentLockFd);
+            }
             path.trimTo(rootLen);
         }
     }
 
     private void releaseSegmentLock(int segmentId, int segmentLockFd) {
-        if (!ff.close(segmentLockFd)) {
+        if (ff.close(segmentLockFd)) {
+            LOG.debug().$("released segment lock [walId=").$(walId)
+                    .$(", segmentId=").$(segmentId)
+                    .$(", fd=").$(segmentLockFd)
+                    .$(']').$();
+        } else {
             LOG.error()
                     .$("cannot close segment lock fd [walId=").$(walId)
                     .$(", segmentId=").$(segmentId)
@@ -1141,6 +1189,14 @@ public class WalWriter implements TableWriterAPI {
     private void releaseWalLock() {
         if (ff.close(walLockFd)) {
             walLockFd = -1;
+            LOG.debug().$("released WAL lock [walId=").$(walId)
+                    .$(", fd=").$(walLockFd)
+                    .$(']').$();
+        } else {
+            LOG.error()
+                    .$("cannot close WAL lock fd [walId=").$(walId)
+                    .$(", fd=").$(walLockFd)
+                    .$(", errno=").$(ff.errno()).I$();
         }
     }
 
@@ -1211,6 +1267,7 @@ public class WalWriter implements TableWriterAPI {
         path.trimTo(rootLen).slash().put(newSegmentId);
         events.openEventFile(path, path.length());
         lastSegmentTxn = events.appendData(0, uncommittedRows, txnMinTimestamp, txnMaxTimestamp, txnOutOfOrder);
+        events.sync();
     }
 
     private void rowAppend(ObjList<Runnable> activeNullSetters, long rowTimestamp) {
@@ -1242,10 +1299,10 @@ public class WalWriter implements TableWriterAPI {
         }
     }
 
-    private void setColumnNull(int columnType, int columnIndex, long rowCount) {
+    private void setColumnNull(int columnType, int columnIndex, long rowCount, int commitMode) {
         if (ColumnType.isVariableLength(columnType)) {
-            setVarColumnVarFileNull(columnType, columnIndex, rowCount);
-            setVarColumnFixedFileNull(columnType, columnIndex, rowCount);
+            setVarColumnVarFileNull(columnType, columnIndex, rowCount, commitMode);
+            setVarColumnFixedFileNull(columnType, columnIndex, rowCount, commitMode);
         } else {
             setFixColumnNulls(columnType, columnIndex, rowCount);
         }
@@ -1299,6 +1356,7 @@ public class WalWriter implements TableWriterAPI {
             } finally {
                 ff.munmap(address, columnFileSize, MEM_TAG);
             }
+            ff.fsync(fixedSizeColumn.getFd());
         }
     }
 
@@ -1307,35 +1365,35 @@ public class WalWriter implements TableWriterAPI {
         rowValueIsNotNull.setQuick(columnIndex, segmentRowCount);
     }
 
-    private void setVarColumnFixedFileNull(int columnType, int columnIndex, long rowCount) {
+    private void setVarColumnFixedFileNull(int columnType, int columnIndex, long rowCount, int commitMode) {
         MemoryMA fixedSizeColumn = getSecondaryColumn(columnIndex);
         long fixedSizeColSize = (rowCount + 1) * Long.BYTES;
         fixedSizeColumn.jumpTo(fixedSizeColSize);
         if (rowCount > 0) {
             long addressFixed = TableUtils.mapRW(ff, fixedSizeColumn.getFd(), fixedSizeColSize, MEM_TAG);
-            try {
-                if (columnType == ColumnType.STRING) {
-                    Vect.setVarColumnRefs32Bit(addressFixed, 0, rowCount + 1);
-                } else {
-                    Vect.setVarColumnRefs64Bit(addressFixed, 0, rowCount + 1);
-                }
-            } finally {
-                ff.munmap(addressFixed, fixedSizeColSize, MEM_TAG);
+            if (columnType == ColumnType.STRING) {
+                Vect.setVarColumnRefs32Bit(addressFixed, 0, rowCount + 1);
+            } else {
+                Vect.setVarColumnRefs64Bit(addressFixed, 0, rowCount + 1);
             }
+            if (commitMode != CommitMode.NOSYNC) {
+                ff.msync(addressFixed, fixedSizeColSize, commitMode == CommitMode.ASYNC);
+            }
+            ff.munmap(addressFixed, fixedSizeColSize, MEM_TAG);
         }
     }
 
-    private void setVarColumnVarFileNull(int columnType, int columnIndex, long rowCount) {
+    private void setVarColumnVarFileNull(int columnType, int columnIndex, long rowCount, int commitMode) {
         MemoryMA varColumn = getPrimaryColumn(columnIndex);
         long varColSize = rowCount * ColumnType.variableColumnLengthBytes(columnType);
         varColumn.jumpTo(varColSize);
         if (rowCount > 0) {
             long address = TableUtils.mapRW(ff, varColumn.getFd(), varColSize, MEM_TAG);
-            try {
-                Vect.memset(address, varColSize, -1);
-            } finally {
-                ff.munmap(address, varColSize, MEM_TAG);
+            Vect.memset(address, varColSize, -1);
+            if (commitMode != CommitMode.NOSYNC) {
+                ff.msync(address, varColSize, commitMode == CommitMode.ASYNC);
             }
+            ff.munmap(address, varColSize, MEM_TAG);
         }
     }
 
@@ -1347,8 +1405,8 @@ public class WalWriter implements TableWriterAPI {
                 long currentOffset = newColumnFiles.get(i * NEW_COL_RECORD_SIZE + 1);
                 long newOffset = newColumnFiles.get(i * NEW_COL_RECORD_SIZE + 2);
                 primaryColumnFile.jumpTo(currentOffset);
-                primaryColumnFile.switchTo(newPrimaryFd, newOffset, Vm.TRUNCATE_TO_POINTER);
 
+                primaryColumnFile.switchTo(newPrimaryFd, newOffset, Vm.TRUNCATE_TO_POINTER);
                 int newSecondaryFd = (int) newColumnFiles.get(i * NEW_COL_RECORD_SIZE + 3);
                 if (newSecondaryFd > -1) {
                     MemoryMA secondaryColumnFile = getSecondaryColumn(i);
@@ -1359,6 +1417,17 @@ public class WalWriter implements TableWriterAPI {
                 }
             }
         }
+    }
+
+    private void sync(int commitMode) {
+        final boolean async = commitMode == CommitMode.ASYNC;
+        for (int i = 0, n = columns.size(); i < n; i++) {
+            MemoryMA column = columns.getQuick(i);
+            if (column != null) {
+                column.sync(async);
+            }
+        }
+        events.sync();
     }
 
     private class MetadataValidatorService implements MetadataServiceStub {
@@ -1435,7 +1504,7 @@ public class WalWriter implements TableWriterAPI {
         }
 
         public void startAlterValidation() {
-            structureVersion = metadata.getStructureVersion();
+            structureVersion = getColumnStructureVersion();
         }
     }
 
@@ -1484,7 +1553,7 @@ public class WalWriter implements TableWriterAPI {
                     // as part of rolling to a new segment
 
                     if (uncommittedRows > 0) {
-                        setColumnNull(columnType, columnIndex, segmentRowCount);
+                        setColumnNull(columnType, columnIndex, segmentRowCount, configuration.getCommitMode());
                     }
                     LOG.info().$("added column to WAL [path=").$(path).$(Files.SEPARATOR).$(segmentId).$(", columnName=").utf8(columnName).I$();
                 } else {
@@ -1685,7 +1754,7 @@ public class WalWriter implements TableWriterAPI {
 
         @Override
         public void putLong128(int columnIndex, long lo, long hi) {
-            MemoryA primaryColumn = getPrimaryColumn(columnIndex);
+            MemoryMA primaryColumn = getPrimaryColumn(columnIndex);
             primaryColumn.putLong(lo);
             primaryColumn.putLong(hi);
             setRowValueNotNull(columnIndex);
@@ -1790,11 +1859,11 @@ public class WalWriter implements TableWriterAPI {
             putLong128(columnIndex, uuid.getLo(), uuid.getHi());
         }
 
-        private MemoryA getPrimaryColumn(int columnIndex) {
+        private MemoryMA getPrimaryColumn(int columnIndex) {
             return columns.getQuick(getPrimaryColumnIndex(columnIndex));
         }
 
-        private MemoryA getSecondaryColumn(int columnIndex) {
+        private MemoryMA getSecondaryColumn(int columnIndex) {
             return columns.getQuick(getSecondaryColumnIndex(columnIndex));
         }
 

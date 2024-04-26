@@ -496,6 +496,33 @@ public class O3CopyJob extends AbstractQueueConsumerJob<O3CopyTask> {
                 );
             }
 
+            final int commitMode = tableWriter.getConfiguration().getCommitMode();
+            if (commitMode != CommitMode.NOSYNC) {
+                syncColumns(
+                        columnCounter,
+                        timestampMergeIndexAddr,
+                        timestampMergeIndexSize,
+                        srcDataFixFd,
+                        srcDataFixAddr,
+                        srcDataFixSize,
+                        srcDataVarFd,
+                        srcDataVarAddr,
+                        srcDataVarSize,
+                        dstFixFd,
+                        dstFixAddr,
+                        dstFixSize,
+                        dstVarFd,
+                        dstVarAddr,
+                        dstVarSize,
+                        srcTimestampFd,
+                        srcTimestampAddr,
+                        srcTimestampSize,
+                        tableWriter,
+                        ff,
+                        commitMode
+                );
+            }
+
             // unmap memory
             O3Utils.unmapAndClose(ff, srcDataFixFd, srcDataFixAddr, srcDataFixSize);
             O3Utils.unmapAndClose(ff, srcDataVarFd, srcDataVarAddr, srcDataVarSize);
@@ -666,6 +693,77 @@ public class O3CopyJob extends AbstractQueueConsumerJob<O3CopyTask> {
         }
     }
 
+    private static void syncColumns(
+            AtomicInteger columnCounter,
+            long timestampMergeIndexAddr,
+            long timestampMergeIndexSize,
+            int srcDataFixFd,
+            long srcDataFixAddr,
+            long srcDataFixSize,
+            int srcDataVarFd,
+            long srcDataVarAddr,
+            long srcDataVarSize,
+            int dstFixFd,
+            long dstFixAddr,
+            long dstFixSize,
+            int dstVarFd,
+            long dstVarAddr,
+            long dstVarSize,
+            int srcTimestampFd,
+            long srcTimestampAddr,
+            long srcTimestampSize,
+            TableWriter tableWriter,
+            FilesFacade ff,
+            int commitMode
+    ) {
+        try {
+            boolean async = commitMode == CommitMode.ASYNC;
+            if (dstFixAddr != 0 && dstFixSize > 0) {
+                ff.msync(dstFixAddr, dstFixSize, async);
+                // sync FD in case we wrote data not via mmap
+                if (dstFixFd != -1 && dstFixFd != 0) {
+                    ff.fsync(Math.abs(dstFixFd));
+                }
+            }
+            if (dstVarAddr != 0 && dstVarSize > 0) {
+                ff.msync(dstVarAddr, dstVarSize, async);
+                if (dstVarFd != -1 && dstVarFd != 0) {
+                    ff.fsync(Math.abs(dstVarFd));
+                }
+            }
+        } catch (Throwable e) {
+            LOG.error()
+                    .$("sync error [table=").utf8(tableWriter.getTableToken().getTableName())
+                    .$(", e=").$(e)
+                    .I$();
+            tableWriter.o3BumpErrorCount();
+            copyIdleQuick(
+                    columnCounter,
+                    timestampMergeIndexAddr,
+                    timestampMergeIndexSize,
+                    srcDataFixFd,
+                    srcDataFixAddr,
+                    srcDataFixSize,
+                    srcDataVarFd,
+                    srcDataVarAddr,
+                    srcDataVarSize,
+                    srcTimestampFd,
+                    srcTimestampAddr,
+                    srcTimestampSize,
+                    dstFixFd,
+                    dstFixAddr,
+                    dstFixSize,
+                    dstVarFd,
+                    dstVarAddr,
+                    dstVarSize,
+                    0,
+                    0,
+                    tableWriter
+            );
+            throw e;
+        }
+    }
+
     private static void updateIndex(
             AtomicInteger columnCounter,
             long timestampMergeIndexAddr,
@@ -702,6 +800,7 @@ public class O3CopyJob extends AbstractQueueConsumerJob<O3CopyTask> {
             }
             try {
                 updateIndex(dstFixAddr, dstFixSize, indexWriter, dstIndexOffset / Integer.BYTES, dstIndexAdjust);
+                indexWriter.commit();
             } finally {
                 if (closed) {
                     Misc.free(indexWriter);

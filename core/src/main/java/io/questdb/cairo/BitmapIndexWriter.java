@@ -38,53 +38,36 @@ import java.io.Closeable;
 
 public class BitmapIndexWriter implements Closeable, Mutable {
     private static final Log LOG = LogFactory.getLog(BitmapIndexWriter.class);
+    private static final long MAX_VALUE_OFFSET = 37L;
+    private final CairoConfiguration configuration;
     private final Cursor cursor = new Cursor();
+    private final FilesFacade ff;
     private final MemoryMARW keyMem = Vm.getMARWInstance();
     private final MemoryMARW valueMem = Vm.getMARWInstance();
     private int blockCapacity;
     private int blockValueCountMod;
-    private FilesFacade ff;
-    private long keyAppendPageSize;
     private int keyCount = -1;
     private long seekValueBlockOffset;
     private long seekValueCount;
     private final BitmapIndexUtils.ValueBlockSeeker SEEKER = this::seek;
-    private long valueAppendPageSize;
     private long valueMemSize = -1;
 
+    @TestOnly
     public BitmapIndexWriter(CairoConfiguration configuration, Path path, CharSequence name, long columnNameTxn) {
-        this(configuration.getFilesFacade(), configuration.getDataIndexKeyAppendPageSize(), configuration.getDataIndexValueAppendPageSize());
-        of(
-                path,
-                name,
-                columnNameTxn
-        );
+        this(configuration);
+        of(path, name, columnNameTxn);
     }
 
-    public BitmapIndexWriter(CairoConfiguration configuration, Path path, CharSequence name, long columnNameTxn, long keyAppendPageSize, long valueAppendPageSize) {
-        this(configuration.getFilesFacade(), keyAppendPageSize, valueAppendPageSize);
-        of(
-                path,
-                name,
-                columnNameTxn
-        );
-    }
-
-    public BitmapIndexWriter(FilesFacade ff, long keyAppendPageSize, long valueAppendPageSize) {
-        this.ff = ff;
-        this.keyAppendPageSize = keyAppendPageSize;
-        this.valueAppendPageSize = valueAppendPageSize;
-    }
-
-    public BitmapIndexWriter() {
+    public BitmapIndexWriter(CairoConfiguration configuration) {
+        this.configuration = configuration;
+        this.ff = configuration.getFilesFacade();
     }
 
     public static void initKeyMemory(MemoryMA keyMem, int blockValueCount) {
-
         // block value count must be power of 2
         assert blockValueCount == Numbers.ceilPow2(blockValueCount);
-        keyMem.toTop();
-        Vect.memset(keyMem.addressOf(0), keyMem.getAppendAddressSize(), 0);
+        keyMem.jumpTo(0);
+        keyMem.truncate();
         keyMem.putByte(BitmapIndexUtils.SIGNATURE);
         keyMem.putLong(1); // SEQUENCE
         Unsafe.getUnsafe().storeFence();
@@ -93,6 +76,7 @@ public class BitmapIndexWriter implements Closeable, Mutable {
         keyMem.putLong(0); // KEY COUNT
         Unsafe.getUnsafe().storeFence();
         keyMem.putLong(1); // SEQUENCE CHECK
+        assert keyMem.getAppendOffset() == MAX_VALUE_OFFSET;
         keyMem.putLong(-1); // maxRow. It's inclusive, -1 means no rows
         keyMem.skip(BitmapIndexUtils.KEY_FILE_RESERVED - keyMem.getAppendOffset());
     }
@@ -152,15 +136,26 @@ public class BitmapIndexWriter implements Closeable, Mutable {
 
     @Override
     public void close() {
-        if (keyMem.isOpen() && keyCount > -1) {
-            keyMem.setSize(keyMemSize());
+        if (keyMem.isOpen()) {
+            if (keyCount > -1) {
+                keyMem.setSize(keyMemSize());
+            }
+            Misc.free(keyMem);
         }
-        Misc.free(keyMem);
 
-        if (valueMem.isOpen() && valueMemSize > -1) {
-            valueMem.setSize(valueMemSize);
+        if (valueMem.isOpen()) {
+            if (valueMemSize > -1) {
+                valueMem.setSize(valueMemSize);
+            }
+            Misc.free(valueMem);
         }
-        Misc.free(valueMem);
+    }
+
+    public void commit() {
+        int commitMode = configuration.getCommitMode();
+        if (commitMode != CommitMode.NOSYNC) {
+            sync(commitMode == CommitMode.ASYNC);
+        }
     }
 
     public RowCursor getCursor(int key) {
@@ -176,7 +171,7 @@ public class BitmapIndexWriter implements Closeable, Mutable {
     }
 
     public long getMaxValue() {
-        return keyMem.getLong(38L);
+        return keyMem.getLong(MAX_VALUE_OFFSET);
     }
 
     @TestOnly
@@ -277,8 +272,7 @@ public class BitmapIndexWriter implements Closeable, Mutable {
             boolean init = indexBlockCapacity > 0;
             BitmapIndexUtils.keyFileName(path, name, columnNameTxn);
             if (init) {
-                this.keyMem.of(ff, path, keyAppendPageSize, 0L, MemoryTag.MMAP_INDEX_WRITER);
-                keyMem.zero();
+                this.keyMem.of(ff, path, configuration.getDataIndexKeyAppendPageSize(), 0L, MemoryTag.MMAP_INDEX_WRITER);
                 initKeyMemory(this.keyMem, indexBlockCapacity);
             } else {
                 boolean exists = ff.exists(path);
@@ -286,7 +280,7 @@ public class BitmapIndexWriter implements Closeable, Mutable {
                     LOG.error().$(path).$(" not found").$();
                     throw CairoException.critical(0).put("Index does not exist: ").put(path);
                 }
-                this.keyMem.of(ff, path, keyAppendPageSize, ff.length(path), MemoryTag.MMAP_INDEX_WRITER);
+                this.keyMem.of(ff, path, configuration.getDataIndexKeyAppendPageSize(), ff.length(path), MemoryTag.MMAP_INDEX_WRITER);
             }
 
             long keyMemSize = this.keyMem.getAppendOffset();
@@ -319,7 +313,7 @@ public class BitmapIndexWriter implements Closeable, Mutable {
             this.valueMem.of(
                     ff,
                     BitmapIndexUtils.valueFileName(path.trimTo(plen), name, columnNameTxn),
-                    valueAppendPageSize,
+                    configuration.getDataIndexValueAppendPageSize(),
                     this.valueMemSize,
                     MemoryTag.MMAP_INDEX_WRITER
             );
@@ -347,13 +341,6 @@ public class BitmapIndexWriter implements Closeable, Mutable {
         } finally {
             path.trimTo(plen);
         }
-    }
-
-    public void of(CairoConfiguration configuration, Path path, CharSequence name, long columnNameTxn, long dataIndexKeyAppendPageSize, long dataIndexValueAppendPageSize) {
-        this.ff = configuration.getFilesFacade();
-        this.keyAppendPageSize = dataIndexKeyAppendPageSize;
-        this.valueAppendPageSize = dataIndexValueAppendPageSize;
-        of(path, name, columnNameTxn);
     }
 
     public void rollbackConditionally(long row) {
@@ -391,7 +378,7 @@ public class BitmapIndexWriter implements Closeable, Mutable {
 
                     if (blockOffset != seekValueBlockOffset) {
                         Unsafe.getUnsafe().storeFence();
-                        keyMem.putLong(offset + BitmapIndexUtils.KEY_ENTRY_OFFSET_VALUE_COUNT + 16, seekValueBlockOffset);
+                        keyMem.putLong(offset + BitmapIndexUtils.KEY_ENTRY_OFFSET_LAST_VALUE_BLOCK_OFFSET, seekValueBlockOffset);
                         Unsafe.getUnsafe().storeFence();
                     }
                     keyMem.putLong(offset + BitmapIndexUtils.KEY_ENTRY_OFFSET_COUNT_CHECK, seekValueCount);
@@ -408,13 +395,17 @@ public class BitmapIndexWriter implements Closeable, Mutable {
     }
 
     public void setMaxValue(long maxValue) {
-        keyMem.putLong(38L, maxValue);
+        keyMem.putLong(MAX_VALUE_OFFSET, maxValue);
+    }
+
+    public void sync(boolean async) {
+        keyMem.sync(async);
+        valueMem.sync(async);
     }
 
     public void truncate() {
-        keyMem.truncate();
-        valueMem.truncate();
         initKeyMemory(keyMem, blockValueCountMod + 1);
+        valueMem.truncate();
         keyCount = 0;
         valueMemSize = 0;
     }

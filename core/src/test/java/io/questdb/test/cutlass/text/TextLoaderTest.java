@@ -811,6 +811,16 @@ public class TextLoaderTest extends AbstractGriffinTest {
     }
 
     @Test
+    public void testDuplicateValueDifferentCaseInFileWithForcedHeader() throws Exception {
+        assertDuplicateColumnErrorDifferentCase(true);
+    }
+
+    @Test
+    public void testDuplicateValueDifferentCaseInFileWithoutForcedHeader() throws Exception {
+        assertDuplicateColumnErrorDifferentCase(false);
+    }
+
+    @Test
     public void testDuplicateValueInFileWithForcedHeader() throws Exception {
         assertDuplicateColumnError(true);
     }
@@ -1312,7 +1322,6 @@ public class TextLoaderTest extends AbstractGriffinTest {
         importWithO3MaxLagAndMaxUncommittedRowsTableNotExists(
                 240_000_000, // 4 minutes, precision is micro
                 3,
-                true,
                 setOf("2021-01-01.2", "2021-01-01.1", "2021-01-01.4", "2021-01-02.1")
         );
     }
@@ -1322,7 +1331,6 @@ public class TextLoaderTest extends AbstractGriffinTest {
         importWithO3MaxLagAndMaxUncommittedRowsTableNotExists(
                 60_000_000, // 1 minute, precision is micro
                 2,
-                false,
                 setOf("2021-01-01.2", "2021-01-01.1", "2021-01-01.4", "2021-01-02.1", "2021-01-02.2", "2021-01-02.4")
         );
     }
@@ -3172,6 +3180,32 @@ public class TextLoaderTest extends AbstractGriffinTest {
         });
     }
 
+    private void assertDuplicateColumnErrorDifferentCase(boolean forceHeader) throws Exception {
+        assertNoLeak(textLoader -> {
+            String csv = "ts,100i,i0,100I\r\n" +
+                    "1972-09-29T00:00:00.000000Z,100.0,i1,1\r\n" +
+                    "1972-09-30T00:00:00.000000Z,25.47,j1,2\r\n";
+
+            configureLoaderDefaults(textLoader, (byte) ',');
+            textLoader.setForceHeaders(forceHeader);
+
+            try {
+                playText(
+                        textLoader,
+                        csv,
+                        200,
+                        "",
+                        "",
+                        -1,
+                        -1
+                );
+                Assert.fail("TextException should be thrown!");
+            } catch (TextException e) {
+                TestUtils.assertContains(e.getFlyweightMessage(), "duplicate column name found");
+            }
+        });
+    }
+
     private void assertNoLeak(TestCode code) throws Exception {
         assertNoLeak(engine, code);
     }
@@ -3258,7 +3292,7 @@ public class TextLoaderTest extends AbstractGriffinTest {
 
     private void configureLoaderDefaults(TextLoader textLoader, byte columnSeparator, int atomicity, boolean overwrite) {
         textLoader.setState(TextLoader.ANALYZE_STRUCTURE);
-        textLoader.configureDestination("test", overwrite, false, atomicity, PartitionBy.NONE, null, null);
+        textLoader.configureDestination("test", overwrite, atomicity, PartitionBy.NONE, null, null);
         if (columnSeparator > 0) {
             textLoader.configureColumnDelimiter(columnSeparator);
         }
@@ -3266,13 +3300,13 @@ public class TextLoaderTest extends AbstractGriffinTest {
 
     private void configureLoaderDefaults(TextLoader textLoader, int atomicity, boolean overwrite, int partitionBy) {
         textLoader.setState(TextLoader.ANALYZE_STRUCTURE);
-        textLoader.configureDestination("test", overwrite, false, atomicity, partitionBy, "ts", null);
+        textLoader.configureDestination("test", overwrite, atomicity, partitionBy, "ts", null);
         textLoader.configureColumnDelimiter((byte) 44);
     }
 
-    private void configureLoaderDefaults(TextLoader textLoader, boolean durable) {
+    private void configureLoaderDefaults2(TextLoader textLoader) {
         textLoader.setState(TextLoader.ANALYZE_STRUCTURE);
-        textLoader.configureDestination("test", false, durable, Atomicity.SKIP_COL, PartitionBy.DAY, "ts", null);
+        textLoader.configureDestination("test", false, Atomicity.SKIP_COL, PartitionBy.DAY, "ts", null);
         textLoader.configureColumnDelimiter((byte) 44);
     }
 
@@ -3326,7 +3360,6 @@ public class TextLoaderTest extends AbstractGriffinTest {
     private void importWithO3MaxLagAndMaxUncommittedRowsTableNotExists(
             long expectedO3MaxLag,
             int maxUncommittedRows,
-            boolean durable,
             Set<String> expectedPartitionNames
     ) throws Exception {
         final AtomicInteger rmdirCallCount = new AtomicInteger();
@@ -3334,10 +3367,10 @@ public class TextLoaderTest extends AbstractGriffinTest {
 
         final FilesFacade ff = new TestFilesFacade() {
             @Override
-            public int msync(long addr, long len, boolean async) {
+            public void msync(long addr, long len, boolean async) {
                 msyncCallCount.incrementAndGet();
                 Assert.assertFalse(async);
-                return Files.msync(addr, len, false);
+                Files.msync(addr, len, false);
             }
 
             @Override
@@ -3387,10 +3420,7 @@ public class TextLoaderTest extends AbstractGriffinTest {
             assertNoLeak(
                     engine,
                     textLoader -> {
-                        configureLoaderDefaults(
-                                textLoader,
-                                durable
-                        );
+                        configureLoaderDefaults2(textLoader);
                         textLoader.setForceHeaders(true);
                         textLoader.setO3MaxLag(expectedO3MaxLag);
                         textLoader.setMaxUncommittedRows(maxUncommittedRows);
@@ -3419,7 +3449,6 @@ public class TextLoaderTest extends AbstractGriffinTest {
                     }
             );
             Assert.assertEquals(expectedPartitionNames.size(), rmdirCallCount.get());
-            Assert.assertTrue((durable && msyncCallCount.get() > 0) || (!durable && msyncCallCount.get() == 0));
             try (TableReader reader = getReader("test")) {
                 Assert.assertEquals(maxUncommittedRows, reader.getMaxUncommittedRows());
                 Assert.assertEquals(expectedO3MaxLag, reader.getO3MaxLag());

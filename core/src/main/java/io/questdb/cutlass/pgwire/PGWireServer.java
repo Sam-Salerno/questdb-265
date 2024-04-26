@@ -24,8 +24,11 @@
 
 package io.questdb.cutlass.pgwire;
 
+import io.questdb.FactoryProvider;
 import io.questdb.Metrics;
 import io.questdb.cairo.CairoEngine;
+import io.questdb.cairo.sql.NetworkSqlExecutionCircuitBreaker;
+import io.questdb.cutlass.auth.Authenticator;
 import io.questdb.griffin.DatabaseSnapshotAgent;
 import io.questdb.griffin.FunctionFactoryCache;
 import io.questdb.griffin.SqlExecutionContextImpl;
@@ -36,6 +39,7 @@ import io.questdb.mp.Job;
 import io.questdb.mp.SCSequence;
 import io.questdb.mp.WorkerPool;
 import io.questdb.network.*;
+import io.questdb.std.MemoryTag;
 import io.questdb.std.Misc;
 import io.questdb.std.ObjectFactory;
 import io.questdb.std.QuietCloseable;
@@ -84,6 +88,7 @@ public class PGWireServer implements Closeable {
             workerPool.assign(i, new Job() {
                 private final IORequestProcessor<PGConnectionContext> processor = (operation, context) -> {
                     try {
+                        metrics.pgWire().makePGConnectionEqualToConnectionTotal(context.getDispatcher().getConnectionCount());
                         if (operation == IOOperation.HEARTBEAT) {
                             context.getDispatcher().registerChannel(context, IOOperation.HEARTBEAT);
                             return false;
@@ -105,13 +110,16 @@ public class PGWireServer implements Closeable {
                                         ? DISCONNECT_REASON_PEER_DISCONNECT_AT_RECV
                                         : DISCONNECT_REASON_PEER_DISCONNECT_AT_SEND
                         );
+                        metrics.pgWire().decreasePGConnections();
                     } catch (BadProtocolException e) {
                         context.getDispatcher().disconnect(context, DISCONNECT_REASON_PROTOCOL_VIOLATION);
+                        metrics.pgWire().decreasePGConnections();
                     } catch (Throwable e) { // must remain last in catch list!
                         LOG.critical().$("internal error [ex=").$(e).$(']').$();
                         // This is a critical error, so we treat it as an unhandled one.
                         metrics.health().incrementUnhandledErrors();
                         context.getDispatcher().disconnect(context, DISCONNECT_REASON_SERVER_ERROR);
+                        metrics.pgWire().decreasePGConnections();
                     }
                     return false;
                 };
@@ -163,12 +171,20 @@ public class PGWireServer implements Closeable {
                 CircuitBreakerRegistry registry,
                 ObjectFactory<SqlExecutionContextImpl> executionContextObjectFactory
         ) {
-            super(() -> new PGConnectionContext(
-                    engine,
-                    configuration,
-                    executionContextObjectFactory.newInstance(),
-                    registry
-            ), configuration.getConnectionPoolInitialCapacity());
+            super(() -> {
+                NetworkSqlExecutionCircuitBreaker circuitBreaker = new NetworkSqlExecutionCircuitBreaker(configuration.getCircuitBreakerConfiguration(), MemoryTag.NATIVE_CB5);
+                PGConnectionContext pgConnectionContext = new PGConnectionContext(
+                        engine,
+                        configuration,
+                        executionContextObjectFactory.newInstance(),
+                        circuitBreaker
+                );
+                FactoryProvider factoryProvider = configuration.getFactoryProvider();
+                NetworkFacade nf = configuration.getNetworkFacade();
+                Authenticator authenticator = factoryProvider.getPgWireAuthenticationFactory().getPgWireAuthenticator(nf, configuration, circuitBreaker, registry, pgConnectionContext);
+                pgConnectionContext.setAuthenticator(authenticator);
+                return pgConnectionContext;
+            }, configuration.getConnectionPoolInitialCapacity());
         }
     }
 }

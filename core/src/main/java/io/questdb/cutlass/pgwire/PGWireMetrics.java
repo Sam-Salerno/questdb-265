@@ -26,15 +26,18 @@ package io.questdb.cutlass.pgwire;
 
 import io.questdb.metrics.LongGauge;
 import io.questdb.metrics.MetricsRegistry;
+import io.questdb.metrics.Counter;
 
 public class PGWireMetrics {
 
     private final LongGauge cachedSelectsGauge;
     private final LongGauge cachedUpdatesGauge;
+    private final Counter connectionsPGWire;
 
     public PGWireMetrics(MetricsRegistry metricsRegistry) {
         this.cachedSelectsGauge = metricsRegistry.newLongGauge("pg_wire_select_queries_cached");
         this.cachedUpdatesGauge = metricsRegistry.newLongGauge("pg_wire_update_queries_cached");
+        this.connectionsPGWire = metricsRegistry.newCounter("pg_wire_connections");
     }
 
     public LongGauge cachedSelectsGauge() {
@@ -43,5 +46,37 @@ public class PGWireMetrics {
 
     public LongGauge cachedUpdatesGauge() {
         return cachedUpdatesGauge;
+    }
+
+    public synchronized void decreasePGConnections() {
+        connectionsPGWire.add(-1);
+    }
+
+    public void increasePGConnections() {
+        connectionsPGWire.inc();
+    }
+
+    public synchronized void makePGConnectionEqualToConnectionTotal(int connectionCount) {
+
+        if (connectionsPGWire.getValue() < connectionCount) {
+            for (long i = connectionsPGWire.getValue(); i < connectionCount; i++) {
+                connectionsPGWire.inc();
+            }
+
+        }
+        // this deals with if the counter is thrown off
+        // it will bring it back to the correct value
+        if (connectionsPGWire.getValue() > connectionCount) {
+            for (long i = connectionsPGWire.getValue(); i < connectionCount; i++) {
+                if (connectionsPGWire.getValue() > 0) {
+                    connectionsPGWire.add(-1);
+                }
+
+            }
+        }
+    }
+
+    public synchronized Counter totalPGConnections() {
+        return connectionsPGWire;
     }
 }
