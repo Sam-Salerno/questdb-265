@@ -289,7 +289,7 @@ public final class Unsafe {
     //#if jdk.version!=8
     private static boolean is32BitJVM() {
         String sunArchDataModel = System.getProperty("sun.arch.data.model");
-        return sunArchDataModel.equals("32");
+        return "32".equals(sunArchDataModel);
     }
     //#endif
 

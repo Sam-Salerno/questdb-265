@@ -75,7 +75,7 @@ public class WalPurgeJob extends SynchronizedJob implements Closeable {
 
         // some code here assumes that WAL_NAME_BASE is "wal", this is to fail the tests if it is not
         //noinspection ConstantConditions
-        assert WalUtils.WAL_NAME_BASE.equals("wal");
+        assert "wal".equals(WalUtils.WAL_NAME_BASE);
         configuration = engine.getConfiguration();
     }
 
