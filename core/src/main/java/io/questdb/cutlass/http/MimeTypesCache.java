@@ -24,6 +24,7 @@
 
 package io.questdb.cutlass.http;
 
+import io.github.pixee.security.BoundedLineReader;
 import io.questdb.std.*;
 import io.questdb.std.str.DirectByteCharSequence;
 import io.questdb.std.str.Path;
@@ -38,7 +39,7 @@ public final class MimeTypesCache extends CharSequenceObjHashMap<CharSequence> {
     @TestOnly
     public MimeTypesCache(InputStream inputStream) {
         try (BufferedReader reader = new BufferedReader(new InputStreamReader(inputStream))) {
-            String line = reader.readLine().trim();
+            String line = BoundedLineReader.readLine(reader, 5_000_000).trim();
             String regex = "\\t+";
             Pattern pattern = Pattern.compile(regex);
 
@@ -53,7 +54,7 @@ public final class MimeTypesCache extends CharSequenceObjHashMap<CharSequence> {
                         this.put(suffixTuple[i].trim(), type);
                     }
                 }
-                line = reader.readLine();
+                line = BoundedLineReader.readLine(reader, 5_000_000);
             }
         } catch (IOException e) {
             throw new RuntimeException(e);
