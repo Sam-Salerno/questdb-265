@@ -24,6 +24,7 @@
 
 package io.questdb.test.std.fastdouble;
 
+import io.github.pixee.security.BoundedLineReader;
 import java.io.BufferedReader;
 import java.io.BufferedWriter;
 import java.io.IOException;
@@ -83,7 +84,7 @@ public class LexicalGenerator {
         Path inPath = FileSystems.getDefault().getPath("data/canada.txt");
         try (BufferedReader r = Files.newBufferedReader(inPath, StandardCharsets.UTF_8);
              BufferedWriter w = Files.newBufferedWriter(outPath, StandardCharsets.UTF_8)) {
-            for (String line = r.readLine(); line != null; line = r.readLine()) {
+            for (String line = BoundedLineReader.readLine(r, 5_000_000); line != null; line = BoundedLineReader.readLine(r, 5_000_000)) {
                 w.write(Double.toHexString(Double.parseDouble(line)));
                 w.write('\n');
             }
