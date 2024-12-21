@@ -33,6 +33,7 @@ import java.io.File;
 import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
+import java.nio.file.Files;
 import java.util.concurrent.locks.LockSupport;
 
 public final class Os {
@@ -188,7 +189,7 @@ public final class Os {
             File tempLib = null;
             try {
                 int dot = lib.indexOf('.');
-                tempLib = File.createTempFile(lib.substring(0, dot), lib.substring(dot));
+                tempLib = Files.createTempFile(lib.substring(0, dot), lib.substring(dot)).toFile();
                 // copy to tempLib
                 try (FileOutputStream out = new FileOutputStream(tempLib)) {
                     byte[] buf = new byte[4096];
