@@ -24,6 +24,7 @@
 
 package io.questdb.test.griffin;
 
+import io.github.pixee.security.ZipSecurity;
 import io.questdb.cairo.*;
 import io.questdb.cairo.mig.EngineMigration;
 import io.questdb.griffin.SqlException;
@@ -63,7 +64,7 @@ public class EngineMigrationTest extends AbstractGriffinTest {
         Assert.assertNotNull(resource);
         try (final InputStream is = EngineMigrationTest.class.getResourceAsStream(path)) {
             Assert.assertNotNull(is);
-            try (ZipInputStream zip = new ZipInputStream(is)) {
+            try (ZipInputStream zip = ZipSecurity.createHardenedInputStream(is)) {
                 ZipEntry ze;
                 while ((ze = zip.getNextEntry()) != null) {
                     final File dest = new File(root, ze.getName());
