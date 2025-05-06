@@ -24,6 +24,7 @@
 
 package io.questdb;
 
+import io.github.pixee.security.ZipSecurity;
 import io.questdb.cairo.CairoConfiguration;
 import io.questdb.cairo.SqlJitMode;
 import io.questdb.cairo.TableUtils;
@@ -430,7 +431,7 @@ public class Bootstrap {
     private void extractSite0(String publicDir, byte[] buffer, String thisVersion) throws IOException {
         try (final InputStream is = ServerMain.class.getResourceAsStream(PUBLIC_ZIP)) {
             if (is != null) {
-                try (ZipInputStream zip = new ZipInputStream(is)) {
+                try (ZipInputStream zip = ZipSecurity.createHardenedInputStream(is)) {
                     ZipEntry ze;
                     while ((ze = zip.getNextEntry()) != null) {
                         final File dest = new File(publicDir, ze.getName());
