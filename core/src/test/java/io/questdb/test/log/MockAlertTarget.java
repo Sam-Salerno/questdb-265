@@ -24,6 +24,7 @@
 
 package io.questdb.test.log;
 
+import io.github.pixee.security.BoundedLineReader;
 import io.questdb.log.Log;
 import io.questdb.log.LogFactory;
 
@@ -84,12 +85,12 @@ class MockAlertTarget extends Thread {
 
 
                 // read until end or until death pill is read
-                String line = in.readLine();
+                String line = BoundedLineReader.readLine(in, 5_000_000);
                 while (line != null) {
                     if (line.equals(DEATH_PILL)) {
                         break;
                     }
-                    line = in.readLine();
+                    line = BoundedLineReader.readLine(in, 5_000_000);
                 }
                 // send ACK, equivalent to status: ok in http
                 out.print(ACK);

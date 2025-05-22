@@ -24,6 +24,7 @@
 
 package io.questdb.test.std;
 
+import io.github.pixee.security.BoundedLineReader;
 import io.questdb.std.*;
 import org.junit.Assert;
 import org.junit.Test;
@@ -50,7 +51,7 @@ public class HashTest {
                 BufferedReader br = new BufferedReader(new InputStreamReader(input, StandardCharsets.UTF_8))
         ) {
             String line;
-            while ((line = br.readLine()) != null) {
+            while ((line = BoundedLineReader.readLine(br, 5_000_000)) != null) {
                 byte[] bytes = line.getBytes(StandardCharsets.UTF_8);
                 for (int i = 0; i < bytes.length; i++) {
                     Unsafe.getUnsafe().putByte(address + i, bytes[i]);
